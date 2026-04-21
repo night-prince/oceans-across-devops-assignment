@@ -73,11 +73,10 @@ jobs:
             echo "environment=dev" >> "$GITHUB_OUTPUT"
           fi
 
-  build_test_deploy:
-    name: build-test-deploy-${{ matrix.service }}
+  build_test:
+    name: build-test-${{ matrix.service }}
     needs: detect_changes
     runs-on: ubuntu-latest
-    environment: ${{ needs.detect_changes.outputs.environment }}
     strategy:
       fail-fast: false
       matrix:
@@ -85,15 +84,12 @@ jobs:
           - frontend
           - backend
           - ai
-    concurrency:
-      group: deploy-${{ matrix.service }}-${{ needs.detect_changes.outputs.environment }}
-      cancel-in-progress: false
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Decide whether this service should run
+      - name: Decide whether this service should build
         id: gate
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -127,7 +123,7 @@ jobs:
 
       - name: Skip when no relevant changes exist
         if: steps.gate.outputs.run_this != 'true'
-        run: echo "No deployable changes for ${{ matrix.service }}."
+        run: echo "No build/test needed for ${{ matrix.service }}."
 
       - name: Build placeholder image
         if: steps.gate.outputs.run_this == 'true'
@@ -145,6 +141,8 @@ jobs:
         env:
           SERVICE: ${{ matrix.service }}
         run: |
+          rm -f response.json
+
           docker run -d --rm \
             --name "smoke-${SERVICE}" \
             -p 8080:8080 \
@@ -158,26 +156,43 @@ jobs:
             sleep 2
           done
 
+          test -f response.json
           cat response.json
           jq -e '.status == "ok"' response.json >/dev/null
           jq -e --arg svc "$SERVICE" '.service == $svc' response.json >/dev/null
 
           docker stop "smoke-${SERVICE}"
 
-      - name: Configure AWS credentials with OIDC
-        if: steps.gate.outputs.run_this == 'true'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
-          role-session-name: gha-${{ matrix.service }}-${{ github.run_id }}
+  deploy:
+    name: deploy-${{ matrix.service }}
+    needs:
+      - detect_changes
+      - build_test
+    runs-on: ubuntu-latest
+    environment: ${{ needs.detect_changes.outputs.environment }}
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - frontend
+          - backend
+          - ai
+    concurrency:
+      group: deploy-${{ matrix.service }}-${{ needs.detect_changes.outputs.environment }}
+      cancel-in-progress: false
 
-      - name: Resolve target EC2 instance
-        if: steps.gate.outputs.run_this == 'true'
-        id: target
+    steps:
+      - name: Decide whether this service should deploy
+        id: gate
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          SELECTED_SERVICE: ${{ github.event.inputs.service }}
           SERVICE: ${{ matrix.service }}
           DEPLOY_ENV: ${{ needs.detect_changes.outputs.environment }}
+          FRONTEND_CHANGED: ${{ needs.detect_changes.outputs.frontend }}
+          BACKEND_CHANGED: ${{ needs.detect_changes.outputs.backend }}
+          AI_CHANGED: ${{ needs.detect_changes.outputs.ai }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
           FRONTEND_DEV_INSTANCE_ID: ${{ vars.FRONTEND_DEV_INSTANCE_ID }}
           FRONTEND_PROD_INSTANCE_ID: ${{ vars.FRONTEND_PROD_INSTANCE_ID }}
           BACKEND_DEV_INSTANCE_ID: ${{ vars.BACKEND_DEV_INSTANCE_ID }}
@@ -185,6 +200,28 @@ jobs:
           AI_DEV_INSTANCE_ID: ${{ vars.AI_DEV_INSTANCE_ID }}
           AI_PROD_INSTANCE_ID: ${{ vars.AI_PROD_INSTANCE_ID }}
         run: |
+          RUN_THIS=false
+          DEPLOY_THIS=false
+          TARGET_INSTANCE_ID=""
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$SELECTED_SERVICE" = "all" ] || [ "$SELECTED_SERVICE" = "$SERVICE" ]; then
+              RUN_THIS=true
+            fi
+          else
+            case "$SERVICE" in
+              frontend)
+                [ "$FRONTEND_CHANGED" = "true" ] && RUN_THIS=true
+                ;;
+              backend)
+                [ "$BACKEND_CHANGED" = "true" ] && RUN_THIS=true
+                ;;
+              ai)
+                [ "$AI_CHANGED" = "true" ] && RUN_THIS=true
+                ;;
+            esac
+          fi
+
           case "${SERVICE}:${DEPLOY_ENV}" in
             frontend:dev) TARGET_INSTANCE_ID="$FRONTEND_DEV_INSTANCE_ID" ;;
             frontend:prod) TARGET_INSTANCE_ID="$FRONTEND_PROD_INSTANCE_ID" ;;
@@ -192,22 +229,34 @@ jobs:
             backend:prod) TARGET_INSTANCE_ID="$BACKEND_PROD_INSTANCE_ID" ;;
             ai:dev) TARGET_INSTANCE_ID="$AI_DEV_INSTANCE_ID" ;;
             ai:prod) TARGET_INSTANCE_ID="$AI_PROD_INSTANCE_ID" ;;
-            *) echo "Unsupported service/environment mapping"; exit 1 ;;
           esac
 
-          if [ -z "$TARGET_INSTANCE_ID" ]; then
-            echo "Missing target instance id for ${SERVICE}:${DEPLOY_ENV}"
-            exit 1
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$RUN_THIS" = "true" ] && [ -n "$AWS_ROLE_ARN" ] && [ -n "$TARGET_INSTANCE_ID" ]; then
+            DEPLOY_THIS=true
           fi
 
+          echo "run_this=$RUN_THIS" >> "$GITHUB_OUTPUT"
+          echo "deploy_this=$DEPLOY_THIS" >> "$GITHUB_OUTPUT"
           echo "target_instance_id=$TARGET_INSTANCE_ID" >> "$GITHUB_OUTPUT"
 
+      - name: Skip deployment
+        if: steps.gate.outputs.deploy_this != 'true'
+        run: echo "Deployment skipped for ${{ matrix.service }}."
+
+      - name: Configure AWS credentials with OIDC
+        if: steps.gate.outputs.deploy_this == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          role-session-name: gha-${{ matrix.service }}-${{ github.run_id }}
+
       - name: Deploy with AWS Systems Manager
-        if: steps.gate.outputs.run_this == 'true'
+        if: steps.gate.outputs.deploy_this == 'true'
         env:
           SERVICE: ${{ matrix.service }}
           DEPLOY_ENV: ${{ needs.detect_changes.outputs.environment }}
-          TARGET_INSTANCE_ID: ${{ steps.target.outputs.target_instance_id }}
+          TARGET_INSTANCE_ID: ${{ steps.gate.outputs.target_instance_id }}
           ARCHIVE_URL: https://codeload.github.com/${{ github.repository }}/tar.gz/${{ github.sha }}
         run: |
           cat > remote-deploy.sh <<'SCRIPT'
