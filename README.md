@@ -152,9 +152,10 @@ docker run -p 8080:8080 oceans-across-payroll-app
 ```
 
 ### CI/CD
-- Push to `main` to trigger the pipeline.
-- The workflow builds and tests the application on every push to `main`.
-- Deployment is performed through AWS Systems Manager rather than direct SSH.
+- Push to `main` triggers the pipeline.
+- The workflow builds and smoke-tests the application on every push to `main`.
+- Deployment uses AWS Systems Manager rather than direct SSH.
+- Live deployment is manual/conditional through `workflow_dispatch` and only runs when the required AWS environment configuration is present.
 - Environment-specific values are injected through Terraform variables, GitHub Variables, GitHub Environments, and AWS Systems Manager Parameter Store instead of being hardcoded in workflow YAML.
 
 ### Terraform File Split
@@ -430,15 +431,15 @@ Tenant offboarding is extended into a formal right-to-erasure workflow covering 
 ### Pipeline Scope
 The CI/CD pipeline is implemented in `.github/workflows/deploy.yml` and runs on every push to `main`. It also supports manual `workflow_dispatch` so a specific service and environment can be selected without waiting for a code push.
 
-The pipeline uses **AWS Systems Manager (SSM)** as the fixed deployment path to EC2. SSH is not used anywhere in the deployment workflow, which keeps the deployment model consistent with the security-first approach selected earlier.
+The workflow always performs build and smoke-test validation for relevant changed services on push. Live deployment to AWS is manual/conditional and only proceeds when the required AWS role and target environment configuration are present.
 
-The workflow builds and smoke-tests a simple Dockerized placeholder app from `docker/Dockerfile`. The same placeholder image pattern is reused for `frontend`, `backend`, and `ai` service lanes by passing the service name as a build argument.
+The pipeline uses **AWS Systems Manager (SSM)** as the deployment path to EC2. SSH is not used anywhere in the deployment workflow, which keeps the deployment model consistent with the security-first approach selected earlier.
 
 The pipeline:
 - runs on every push to `main`
 - builds the Dockerized application
-- runs basic validation and test steps
-- deploys to EC2 using AWS Systems Manager
+- runs basic validation and smoke-test steps
+- supports manual/conditional deployment to EC2 using AWS Systems Manager
 - avoids direct SSH-based deployment exposure
 - keeps environment-specific configuration outside source code and workflow YAML
 
