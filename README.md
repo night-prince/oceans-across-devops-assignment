@@ -1,7 +1,7 @@
 # DevOps Engineer Technical Assignment – Oceans Across
 
 Security-first AWS infrastructure design for a UK payroll platform serving Companies, Bureaus, and Employees.
-
+NOTE - Setup Instructions present in section 7 of the README document.
 ---
 
 ## 1. Executive Summary
